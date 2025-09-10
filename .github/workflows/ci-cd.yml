@@ -1,0 +1,167 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "18"
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_SERVICE_NAME: nextjs-landing-page
+  GCP_REGION: us-central1
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linting
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test -- --coverage --watchAll=false
+
+      - name: Upload test coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-files
+          path: |
+            .next/
+            public/
+            package.json
+            package-lock.json
+          retention-days: 1
+
+  deploy:
+    name: Deploy to GCP
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-files
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Configure Docker to use gcloud as a credential helper
+        run: gcloud auth configure-docker
+
+      - name: Build Docker image
+        run: |
+          docker build -t gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.GCP_SERVICE_NAME }}:${{ github.sha }} .
+          docker tag gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.GCP_SERVICE_NAME }}:${{ github.sha }} gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.GCP_SERVICE_NAME }}:latest
+
+      - name: Push Docker image to GCR
+        run: |
+          docker push gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.GCP_SERVICE_NAME }}:${{ github.sha }}
+          docker push gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.GCP_SERVICE_NAME }}:latest
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.GCP_SERVICE_NAME }} \
+            --image gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.GCP_SERVICE_NAME }}:${{ github.sha }} \
+            --platform managed \
+            --region ${{ env.GCP_REGION }} \
+            --allow-unauthenticated \
+            --memory 512Mi \
+            --cpu 1 \
+            --port 3000 \
+            --set-env-vars NODE_ENV=production
+
+      - name: Get service URL
+        id: get-url
+        run: |
+          SERVICE_URL=$(gcloud run services describe ${{ env.GCP_SERVICE_NAME }} --platform managed --region ${{ env.GCP_REGION }} --format 'value(status.url)')
+          echo "service_url=$SERVICE_URL" >> $GITHUB_OUTPUT
+          echo "🚀 Deployment successful! Service URL: $SERVICE_URL"
+
+      - name: Run smoke test
+        run: |
+          # Test main page
+          curl -f ${{ steps.get-url.outputs.service_url }} || exit 1
+          echo "✅ Main page is accessible"
+
+          # Test health endpoint
+          curl -f ${{ steps.get-url.outputs.service_url }}/api/health || exit 1
+          echo "✅ Health check endpoint is working"
+
+          echo "✅ All smoke tests passed!"
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always() && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Deployment Success
+        if: needs.deploy.result == 'success'
+        run: echo "🎉 Deployment to GCP Cloud Run was successful!"
+
+      - name: Deployment Failure
+        if: needs.deploy.result == 'failure'
+        run: |
+          echo "❌ Deployment failed!"
+          exit 1
